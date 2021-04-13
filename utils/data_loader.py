@@ -182,6 +182,8 @@ class Dataloader:
             return self._load_amazon_book()
         elif self._name == 'movielens_20m':
             return self._load_movielens_20m()
+        elif self._name == 'drug':
+            return self._load_DrugRepurpose()
         else:
             raise NotImplementedError
 
@@ -489,6 +491,133 @@ class Dataloader:
             topk_set = MyDataset(user_pth, item_pth, user_metas, item_metas, topk_list[:,:2], topk_list[:,2])
             test_loader= DataLoader(dataset=topk_set, batch_size = self.batch_size, shuffle=False)
         return user_metas, item_metas, train_loader, eval_loader, test_loader, hg.num_nodes('user'), hg.num_nodes('movie'), hg.num_nodes('genre'), hg.num_nodes('genre'), hg.num_nodes('genre')
+
+    def _load_DrugRepurpose(self):
+        # Drug-Disease 1519 1229 6677
+        # Drug-Protein 1519 1025 6744
+        # Drug-SideEffect 1519 12904 382041 
+        # Drug-Drug 1519 1519 290836
+
+        if self._data == None:
+            self._data = '../data/DDdataset'
+        pkl_filename = 'DrugRepurpose_hg.pkl'
+        #Load or construct Graph
+        src_key = ['drug'] * 4
+        dst_key = ['disease', 'protein', 'sideeffect', 'drug']
+        etype_name = ['treats','interacts-dp', 'causes', 'interacts-dd']
+        etype_name_reverse = [e_n + '-reverse' for e_n in etype_name]
+
+        edge = [(src_key[i], etype_name[i], dst_key[i]) for i in range(len(src_key))]
+        edge_reverse = [(dst_key[i], etype_name_reverse[i], src_key[i]) for i in range(len(src_key))]
+
+        if (os.path.exists(os.path.join(self._path, pkl_filename))):
+            hg_file = open(os.path.join(self._path, pkl_filename),'rb')
+            hg = pkl.load(hg_file)
+            hg_file.close()
+            print("Graph Loaded.")
+        else:
+            #Construct graph from raw data.
+            # load data of DrugRepurpose
+            _data_list = ['drugDisease.txt', 'drugProtein.txt', 'drugsideEffect.txt', 'drugdrug.txt']
+            htg = {}
+
+            for i, filename in enumerate(_data_list):
+                with open(os.path.join(self._data, filename)) as fin:
+                    src_list = []
+                    dst_list = []
+                    for line in fin:
+                        line = line.strip().split('\t')
+                        src_list.append(int(line[0]))
+                        dst_list.append(int(line[1]))
+                    htg[edge[i]] = (src_list, dst_list)
+                    htg[edge_reverse[i]] = (dst_list, src_list)
+            
+            #build graph
+            hg = dgl.heterograph(htg)
+
+            with open(os.path.join(self._path, pkl_filename), 'wb') as file: 
+                pkl.dump(hg, file)
+            print("Graph constructed.")
+        print(hg.canonical_etypes)
+        # Split data.
+        z= hg.edges(etype= edge_reverse[0])
+        etype_name = etype_name_reverse[0]
+        user_item_src = z[0].numpy().tolist()
+        user_item_dst = z[1].numpy().tolist()
+        user_item_link = hg.num_edges(etype_name)
+        if (os.path.exists(os.path.join(self._path, 'DrugRepurpose_train_'+str(self.ratio)+'.pkl'))):
+            train_file = open(self._path+'/'+'DrugRepurpose_train_'+str(self.ratio)+'.pkl','rb')
+            train_data = pkl.load(train_file)
+            train_file.close()
+            test_file = open(self._path+'/'+'DrugRepurpose_test_1.pkl','rb')
+            test_data = pkl.load(test_file)
+            test_file.close()
+            eval_file = open(self._path+'/'+'DrugRepurpose_eval_'+str(self.ratio)+'.pkl','rb')
+            eval_data = pkl.load(eval_file)
+            eval_file.close()
+            print("Train, eval, and test loaded.")
+        else:
+            if self.ratio == 1:
+                train_data, eval_data, test_data = self.split_data(hg, etype_name, user_item_src, user_item_dst,user_item_link,'DrugRepurpose')
+            else:
+                if (os.path.exists(os.path.join(self._path, 'DrugRepurpose_train_1.pkl'))) == False:
+                    train_data, eval_data, test_data = self.split_data(hg, etype_name, user_item_src, user_item_dst,user_item_link,'DrugRepurpose')
+                train_data, eval_data, test_data = self.dataset_sample('DrugRepurpose')
+            print("Train, eval, and test splited.")
+
+        #Prepare dataset
+        #Define meta-paths.
+        scale='_'+str(self._num_walks_per_node)+'_'+str(self._walk_length)
+        item_paths = [['treats'],['treats', 'treats-reverse', 'treats'], 
+                    ['interacts-dp', 'interacts-dp-reverse', 'treats'], 
+                    ['interacts-dd', 'interacts-dd-reverse', 'treats'],
+                    ['causes', 'causes-reverse', 'treats'],
+                    ]
+
+        user_paths = [[ edge.replace('-reverse', '') if '-reverse' in edge else (edge + '-reverse') 
+                        for edge in reversed(metapath)] 
+                        for metapath in item_paths]
+        
+        item_metas=['UI','UIUI', 'UAUI', 'UBUI', 'UCUI'] # A: protein, B: drug, C: sideeffect
+        user_metas=['IU','IUIU', 'IUAU', 'IUBU', 'IUCU']
+        user_pkl='DrugRepurpose_user'+scale+'.pkl'
+        item_pkl='DrugRepurpose_item'+scale+'.pkl'
+
+        #Generate paths.
+        if self.saved == True or not (os.path.exists(self._path+'/'+user_pkl)):
+            self.generate_metapath(hg,'disease',user_paths, user_metas, self._path, user_pkl)
+            self.generate_metapath(hg,'drug',item_paths, item_metas, self._path, item_pkl)
+            print("Paths sampled.")
+
+        print("Load paths from:")
+        print(user_pkl)
+        print(item_pkl)
+        user_file = open(self._path+'/'+user_pkl,'rb')
+        user_pth = pkl.load(user_file)
+        user_file.close()
+        item_file = open(self._path+'/'+item_pkl,'rb')
+        item_pth = pkl.load(item_file)
+        item_file.close()
+        train_set = MyDataset(user_pth, item_pth, user_metas, item_metas, train_data[:,:2], train_data[:,2])
+        eval_set = MyDataset(user_pth, item_pth, user_metas, item_metas, eval_data[:,:2], eval_data[:,2])
+        test_set = MyDataset(user_pth, item_pth, user_metas, item_metas, test_data[:,:2], test_data[:,2])
+        train_loader= DataLoader(dataset=train_set, batch_size = self.batch_size, shuffle=True)
+        eval_loader= DataLoader(dataset=eval_set, batch_size = self.batch_size, shuffle=True)
+        test_loader= DataLoader(dataset=test_set, batch_size = self.batch_size, shuffle=True)
+
+        #Prepare topk test set.
+        if self.is_topk == True:
+            if (os.path.exists(os.path.join(self._path, 'DrugRepurpose_topk_'+str(self.list_length)+'_.pkl'))):
+                topk_file = open(self._path+'/'+'DrugRepurpose_topk_'+str(self.list_length)+'_.pkl','rb')
+                topk_list = pkl.load(topk_file)
+                topk_file.close()
+                print("Top K loaded.")
+            else:
+                topk_list = self.generate_topklist('DrugRepurpose',test_data, list_length = self.list_length)
+                print("Top K generated.")
+            topk_set = MyDataset(user_pth, item_pth, user_metas, item_metas, topk_list[:,:2], topk_list[:,2])
+            test_loader= DataLoader(dataset=topk_set, batch_size = self.batch_size, shuffle=False)
+        return user_metas, item_metas, train_loader, eval_loader, test_loader, hg.num_nodes('disease'), hg.num_nodes('drug'), hg.num_nodes('protein'), hg.num_nodes('drug'), hg.num_nodes('sideeffect')
 
     def _load_yelp(self):
         #business: 14284             user: 16239 

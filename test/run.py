@@ -109,10 +109,9 @@ def train(model, device, optimizer, train_loader, eval_loader, save_dir, epochs,
 
 def test(model, device, test_loader, writer):
     test_loss = []
-    test_auc = []
-    test_acc = []
     test_logloss = []
-    test_f1 = []
+    pred_list = None
+    label_list = None
     with torch.no_grad():
         for i, data in enumerate(tqdm(test_loader)):
             UI, IU, UIUI, IUIU, UIAI1, IAIU1, UIAI2, IAIU2, UIAI3, IAIU3, labels = data
@@ -124,14 +123,19 @@ def test(model, device, test_loader, writer):
         
             loss = criterion(pred, labels.to(device))
 
-            auc = utils.evaluate_auc(pred.detach().cpu().numpy(), labels.numpy())
-            acc = utils.evaluate_acc(pred.detach().cpu().numpy(), labels.numpy())
-            f1 = utils.evaluate_f1_score(pred.detach().cpu().numpy(), labels.numpy())
-            logloss = utils.evaluate_logloss(pred.detach().cpu().numpy(), labels.numpy())
+            pred = pred.detach().cpu().numpy()
+            labels = labels.numpy()
+
+            if pred_list is None:
+                pred_list = pred
+            else:
+                np.vstack([pred_list, pred])
+            if label_list is None:
+                label_list = labels
+            else:
+                np.vstack([label_list, labels])
+            logloss = utils.evaluate_logloss(pred, labels)
             test_loss.append(loss.item())
-            test_auc.append(auc)
-            test_acc.append(acc)
-            test_f1.append(f1)
             test_logloss.append(logloss)
             writer.add_scalar('Loss/Test', loss.item(), i)
             writer.add_scalar('Logloss/Test', logloss, i)
@@ -143,16 +147,15 @@ def test(model, device, test_loader, writer):
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
             '''
-            
+        test_auc = utils.evaluate_auc(pred_list, label_list)
+        test_acc = utils.evaluate_acc(pred_list, label_list)
+        test_f1 = utils.evaluate_f1_score(pred_list, label_list)
         
         test_loss = np.mean(test_loss)
-        test_auc = np.mean(test_auc)
-        test_acc = np.mean(test_acc)
-        test_f1 = np.mean(test_f1)
         test_logloss = np.mean(test_logloss)
         writer.add_scalar('AUC/Test', test_auc, i)
         writer.add_scalar('Acc/Test', test_acc, i)
-        writer.add_scalar('F1/Test', f1, i)
+        writer.add_scalar('F1/Test', test_f1, i)
         print('Test Loss {:.4f} | Test AUC {:.4f} | Test ACC {:.4f} | Test F1 {:.4f} | Test Logloss {:.4f} |'.format(test_loss, test_auc, test_acc, test_f1, test_logloss))
 
 
@@ -221,7 +224,7 @@ if __name__ == "__main__":
     log_name = args.model + '_'+ args.d + '_'+ args.model_num +'.txt'
     model_name = args.model + '_'+ args.d + '_'+ args.model_num +'.pth'
     save_dir = args.save_dir
-    startDateTime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    startDateTime = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     log_dir = save_dir+'/Logs/'+model_name+'_train_' + startDateTime
     if not os.path.exists(log_dir):
         os.mkdir(log_dir)
