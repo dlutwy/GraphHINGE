@@ -125,15 +125,12 @@ def test(model, device, test_loader, writer):
 
             pred = pred.detach().cpu().numpy()
             labels = labels.numpy()
-
             if pred_list is None:
                 pred_list = pred
-            else:
-                np.vstack([pred_list, pred])
-            if label_list is None:
                 label_list = labels
             else:
-                np.vstack([label_list, labels])
+                pred_list = np.vstack([pred_list, pred])
+                label_list = np.vstack([label_list, labels])
             logloss = utils.evaluate_logloss(pred, labels)
             test_loss.append(loss.item())
             test_logloss.append(logloss)

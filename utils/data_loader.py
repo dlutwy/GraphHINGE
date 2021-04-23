@@ -43,17 +43,20 @@ class MyDataset(Dataset):
         return self.len
 
 class Dataloader:
-    def __init__(self, data_path=None, name=None, pkl_path=None, saved=False, num_walks=20,walk_length=1, batch_size=128, is_topk = False, list_length=10, ratio=1):
+    def __init__(self, data_path=None, name=None, pkl_path=None, saved=False, num_walks=20,walk_length=1, batch_size=128, inference = False, is_topk = False, list_length=10, ratio=1):
         self._data = data_path
         self._name = name
-        self._path = pkl_path
         self._num_walks_per_node = num_walks
         self._walk_length = walk_length
         self.saved = saved
         self.batch_size = batch_size
         self.is_topk = is_topk
         self.list_length = list_length
-        self.ratio = ratio # [0-1] only sample ratio * 100% data to train/val/test 
+        self.ratio = ratio # [0-1] only sample ratio * 100% data to train/val/test
+        self.inference = inference
+        self._path = pkl_path + ("_inference" if inference else "")
+        if not os.path.exists(self._path):
+            os.mkdir(self._path)
 
     def generate_metapath(self,hg,head,meta_paths,path_names,path,name):
         """
@@ -443,6 +446,21 @@ class Dataloader:
                 train_data, eval_data, test_data = self.dataset_sample('movielens')
             print("Train, eval, and test splited.")
 
+
+        # Remove Positive Edge from dgl
+        if not self.inference:
+            to_remove_data_src = []
+            to_remove_data_dst = []
+            for src, dst, label in np.vstack([eval_data, test_data]):
+                if label == 1:
+                    to_remove_data_src.append(src)
+                    to_remove_data_dst.append(dst)
+            to_remove_edge_id = hg.edge_ids(to_remove_data_src, to_remove_data_dst, etype = 'um')
+            hg.remove_edges(to_remove_edge_id, etype = 'um')
+            to_remove_edge_id = hg.edge_ids(to_remove_data_dst, to_remove_data_src, etype = 'mu')
+            hg.remove_edges(to_remove_edge_id, etype = 'mu')
+
+
         #Prepare dataset
         #Define meta-paths.
         scale='_'+str(self._num_walks_per_node)+'_'+str(self._walk_length)
@@ -506,11 +524,11 @@ class Dataloader:
         #Load or construct Graph
         src_key = ['drug'] * 4
         dst_key = ['disease', 'protein', 'sideeffect', 'drug']
-        etype_name = ['treats','interacts-dp', 'causes', 'interacts-dd']
-        etype_name_reverse = [e_n + '-reverse' for e_n in etype_name]
+        etype_names = ['treats','interacts-dp', 'causes', 'interacts-dd']
+        etype_names_reverse = [e_n + '-reverse' for e_n in etype_names]
 
-        edge = [(src_key[i], etype_name[i], dst_key[i]) for i in range(len(src_key))]
-        edge_reverse = [(dst_key[i], etype_name_reverse[i], src_key[i]) for i in range(len(src_key))]
+        edge = [(src_key[i], etype_names[i], dst_key[i]) for i in range(len(src_key))]
+        edge_reverse = [(dst_key[i], etype_names_reverse[i], src_key[i]) for i in range(len(src_key))]
 
         if (os.path.exists(os.path.join(self._path, pkl_filename))):
             hg_file = open(os.path.join(self._path, pkl_filename),'rb')
@@ -543,7 +561,7 @@ class Dataloader:
         print(hg.canonical_etypes)
         # Split data.
         z= hg.edges(etype= edge_reverse[0])
-        etype_name = etype_name_reverse[0]
+        etype_name = etype_names_reverse[0]
         user_item_src = z[0].numpy().tolist()
         user_item_dst = z[1].numpy().tolist()
         user_item_link = hg.num_edges(etype_name)
@@ -566,6 +584,19 @@ class Dataloader:
                     train_data, eval_data, test_data = self.split_data(hg, etype_name, user_item_src, user_item_dst,user_item_link,'DrugRepurpose')
                 train_data, eval_data, test_data = self.dataset_sample('DrugRepurpose')
             print("Train, eval, and test splited.")
+
+        # Remove Positive Edge from dgl
+        if not self.inference:
+            to_remove_data_src = []
+            to_remove_data_dst = []
+            for src, dst, label in np.vstack([eval_data, test_data]):
+                if label == 1:
+                    to_remove_data_src.append(src)
+                    to_remove_data_dst.append(dst)
+            to_remove_edge_id = hg.edge_ids(to_remove_data_src, to_remove_data_dst, etype = etype_names_reverse[0])
+            hg.remove_edges(to_remove_edge_id, etype = etype_names_reverse[0])
+            to_remove_edge_id = hg.edge_ids(to_remove_data_dst, to_remove_data_src, etype = etype_names[0])
+            hg.remove_edges(to_remove_edge_id, etype = etype_names[0])
 
         #Prepare dataset
         #Define meta-paths.
@@ -1580,6 +1611,7 @@ if __name__ == "__main__":
     parser.add_argument('-n', type=int, default=20,help='Num of walks per node.')
     parser.add_argument('-w', type=int, default=1,help='Scale of walk length.')
     parser.add_argument('-ratio', type=float, default=1,help='Sample ratio.')
+    parser.add_argument('-i', type=bool, default=False,help='Inference stage. (Train ALL data and inference new links between users and items)')
     args = parser.parse_args()
 
-    Dataloader(args.p, args.d, args.o, args.s, args.n, args.w, args.b,ratio=args.ratio).load_data()
+    Dataloader(args.p, args.d, args.o, args.s, args.n, args.w, args.b, args.i,ratio=args.ratio).load_data()

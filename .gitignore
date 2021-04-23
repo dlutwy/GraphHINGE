@@ -246,3 +246,6 @@ sympy-plots-for-*.tex/
 *.pdf
 *.pem
 .DS_Store
+
+*.sh
+note.md
