@@ -5,7 +5,8 @@ import dgl
 import sys
 import os
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler, BatchSampler
+from sklearn.model_selection import KFold
 import pickle as pkl
 from itertools import *
 import argparse
@@ -42,8 +43,35 @@ class MyDataset(Dataset):
     def __len__(self):
         return self.len
 
+class InferenceFilter(Sampler):
+    def __init__(self, mydataset, userid = None, itemid = None):
+        self.x_data_ori = mydataset.x_data
+        if userid is None:
+            self.user_max_id = max(self.x_data_ori[:, 0])
+            self.userid = set(range(self.user_max_id + 1))
+        else:
+            self.userid = set(userid)
+
+        if itemid is None:
+            self.item_max_id = max(self.x_data_ori[:, 1])
+            self.itemid = set(range(self.item_max_id + 1))
+        else:
+            self.itemid = set(itemid)
+        # print("Infer sampler", self.userid, self.itemid)
+        infer_idx = []
+        for idx, (user, item) in enumerate(self.x_data_ori):
+            if user in self.userid and item in self.itemid:
+                infer_idx.append(idx)
+        self.infer_idx = infer_idx
+
+    def __len__(self):
+        return len(self.infer_idx)
+
+    def __iter__(self):
+        return iter(self.infer_idx)
+
 class Dataloader:
-    def __init__(self, data_path=None, name=None, pkl_path=None, saved=False, num_walks=20,walk_length=1, batch_size=128, inference = False, is_topk = False, list_length=10, ratio=1):
+    def __init__(self, data_path=None, name=None, pkl_path=None, saved=False, num_walks=20,walk_length=1, batch_size=128, inference = False, is_topk = False, list_length=10, ratio=1, usersid = None, itemsid = None, kfold = False):
         self._data = data_path
         self._name = name
         self._num_walks_per_node = num_walks
@@ -54,7 +82,10 @@ class Dataloader:
         self.list_length = list_length
         self.ratio = ratio # [0-1] only sample ratio * 100% data to train/val/test
         self.inference = inference
-        self._path = pkl_path + ("_inference" if inference else "")
+        self._path = pkl_path #+ ("_inference" if inference else "")
+        self.kfold = kfold
+        self.usersid = usersid
+        self.itemsid = itemsid
         if not os.path.exists(self._path):
             os.mkdir(self._path)
 
@@ -80,7 +111,9 @@ class Dataloader:
         dict={}
         for meta_path, path_name in zip(meta_paths, path_names):
             dict[path_name]={}
-            for idx in tqdm.trange(hg.number_of_nodes(head)):
+            pbar = tqdm.trange(hg.number_of_nodes(head))
+            for idx in pbar:
+                pbar.set_description(f"Generate path: {path_name}")
                 traces, _ = dgl.sampling.random_walk(
                     hg, [idx] * self._num_walks_per_node, metapath=meta_path * self._walk_length)
                 dict[path_name][idx]=traces.long()
@@ -98,14 +131,21 @@ class Dataloader:
         pos_data=list(zip(user_item_src,user_item_dst,pos_label))
         user_item_adj = np.array(hg.adj(etype=etype_name).to_dense())
         full_idx = np.where(user_item_adj==0)
+        if self.inference or self.kfold:
+            train_ratio = 1
+            eval_ratio = 0
+        else:
+            train_ratio = 0.6
+            eval_ratio = 0.2
+            
         sample = random.sample(range(0, len(full_idx[0])), user_item_link)
         neg_label = [0]*user_item_link
         neg_data = list(zip(full_idx[0][sample],full_idx[1][sample],neg_label))
         full_data = pos_data + neg_data
         random.shuffle(full_data)
 
-        train_size = int(len(full_data) * 0.6)
-        eval_size = int(len(full_data) * 0.2)
+        train_size = int(len(full_data) * train_ratio)
+        eval_size = int(len(full_data) * eval_ratio)
         test_size = len(full_data) - train_size - eval_size
         train_data = full_data[:train_size]
         eval_data = full_data[train_size : train_size+eval_size]
@@ -113,12 +153,19 @@ class Dataloader:
         train_data = np.array(train_data)
         eval_data = np.array(eval_data)
         test_data = np.array(test_data)
+        if self.inference:
+            inferIdx = []
+            for idx in range(0, len(full_idx[0])):
+                inferIdx.append(idx)
+            infer_data = list(zip(full_idx[0][inferIdx],full_idx[1][inferIdx], [0] * len(inferIdx)))
+            test_data = np.array(infer_data)
+        else:
+            with open(os.path.join(self._path, data_name+'_eval_1.pkl'), 'wb') as file: 
+                pkl.dump(eval_data, file)
         with open(os.path.join(self._path, data_name+'_train_1.pkl'), 'wb') as file: 
             pkl.dump(train_data, file)
         with open(os.path.join(self._path, data_name+'_test_1.pkl'), 'wb') as file: 
             pkl.dump(test_data, file)
-        with open(os.path.join(self._path, data_name+'_eval_1.pkl'), 'wb') as file: 
-            pkl.dump(eval_data, file)
         return train_data, eval_data, test_data
     
     def dataset_sample(self,data_name):
@@ -167,7 +214,30 @@ class Dataloader:
         with open(os.path.join(self._path, data_name+'_topk_'+str(list_length)+'_.pkl'), 'wb') as file: 
             pkl.dump(topk_list, file)
         return topk_list              
-    
+
+    def removePositiveEdge(self, hg, etype1, etype2, eval_data = None, test_data = None):
+        # Remove Positive Edge from dgl
+        to_remove_data_src = []
+        to_remove_data_dst = []
+        to_add_data_src = []
+        to_add_data_dst = []
+        if eval_data is not None:
+            for src, dst, label in eval_data:
+                if label == 1:
+                    to_remove_data_src.append(src)
+                    to_remove_data_dst.append(dst)
+        if test_data is not None:
+            for src, dst, label in test_data:
+                if label == 1:
+                    to_remove_data_src.append(src)
+                    to_remove_data_dst.append(dst)
+        
+        to_remove_edge_id = hg.edge_ids(to_remove_data_src, to_remove_data_dst, etype = etype1)
+        hg.remove_edges(to_remove_edge_id, etype = etype1[0])
+        to_remove_edge_id = hg.edge_ids(to_remove_data_dst, to_remove_data_src, etype = etype2)
+        hg.remove_edges(to_remove_edge_id, etype = etype2[0])
+        return hg
+
     def load_data(self):
         if self._name == 'amazon':
             return self._load_amazon()
@@ -449,17 +519,7 @@ class Dataloader:
 
         # Remove Positive Edge from dgl
         if not self.inference:
-            to_remove_data_src = []
-            to_remove_data_dst = []
-            for src, dst, label in np.vstack([eval_data, test_data]):
-                if label == 1:
-                    to_remove_data_src.append(src)
-                    to_remove_data_dst.append(dst)
-            to_remove_edge_id = hg.edge_ids(to_remove_data_src, to_remove_data_dst, etype = 'um')
-            hg.remove_edges(to_remove_edge_id, etype = 'um')
-            to_remove_edge_id = hg.edge_ids(to_remove_data_dst, to_remove_data_src, etype = 'mu')
-            hg.remove_edges(to_remove_edge_id, etype = 'mu')
-
+            hg = self.removePositiveEdge(hg, "um", "mu", eval_data= eval_data, test_data = test_data)
 
         #Prepare dataset
         #Define meta-paths.
@@ -495,8 +555,8 @@ class Dataloader:
         eval_set = MyDataset(user_pth, item_pth, user_metas, item_metas, eval_data[:,:2], eval_data[:,2])
         test_set = MyDataset(user_pth, item_pth, user_metas, item_metas, test_data[:,:2], test_data[:,2])
         train_loader= DataLoader(dataset=train_set, batch_size = self.batch_size, shuffle=True)
-        eval_loader= DataLoader(dataset=eval_set, batch_size = self.batch_size, shuffle=True)
-        test_loader= DataLoader(dataset=test_set, batch_size = self.batch_size, shuffle=True)
+        eval_loader= DataLoader(dataset=eval_set, batch_size = self.batch_size, shuffle=False)
+        test_loader= DataLoader(dataset=test_set, batch_size = self.batch_size, shuffle=False)
 
         #Prepare topk test set.
         if self.is_topk == True:
@@ -558,7 +618,6 @@ class Dataloader:
             with open(os.path.join(self._path, pkl_filename), 'wb') as file: 
                 pkl.dump(hg, file)
             print("Graph constructed.")
-        print(hg.canonical_etypes)
         # Split data.
         z= hg.edges(etype= edge_reverse[0])
         etype_name = etype_names_reverse[0]
@@ -572,10 +631,13 @@ class Dataloader:
             test_file = open(self._path+'/'+'DrugRepurpose_test_1.pkl','rb')
             test_data = pkl.load(test_file)
             test_file.close()
-            eval_file = open(self._path+'/'+'DrugRepurpose_eval_'+str(self.ratio)+'.pkl','rb')
-            eval_data = pkl.load(eval_file)
-            eval_file.close()
-            print("Train, eval, and test loaded.")
+            if not self.inference:
+                eval_file = open(self._path+'/'+'DrugRepurpose_eval_'+str(self.ratio)+'.pkl','rb')
+                eval_data = pkl.load(eval_file)
+                eval_file.close()
+                print("Train, eval, and test loaded.")
+            else:
+                print("Train, Inference loaded.")
         else:
             if self.ratio == 1:
                 train_data, eval_data, test_data = self.split_data(hg, etype_name, user_item_src, user_item_dst,user_item_link,'DrugRepurpose')
@@ -585,18 +647,11 @@ class Dataloader:
                 train_data, eval_data, test_data = self.dataset_sample('DrugRepurpose')
             print("Train, eval, and test splited.")
 
+
         # Remove Positive Edge from dgl
-        if not self.inference:
-            to_remove_data_src = []
-            to_remove_data_dst = []
-            for src, dst, label in np.vstack([eval_data, test_data]):
-                if label == 1:
-                    to_remove_data_src.append(src)
-                    to_remove_data_dst.append(dst)
-            to_remove_edge_id = hg.edge_ids(to_remove_data_src, to_remove_data_dst, etype = etype_names_reverse[0])
-            hg.remove_edges(to_remove_edge_id, etype = etype_names_reverse[0])
-            to_remove_edge_id = hg.edge_ids(to_remove_data_dst, to_remove_data_src, etype = etype_names[0])
-            hg.remove_edges(to_remove_edge_id, etype = etype_names[0])
+        if not self.inference and not self.kfold:
+            hg = self.removePositiveEdge(hg, etype_names_reverse[0], etype_names[0], eval_data= eval_data, test_data = test_data)
+
 
         #Prepare dataset
         #Define meta-paths.
@@ -616,6 +671,37 @@ class Dataloader:
         user_pkl='DrugRepurpose_user'+scale+'.pkl'
         item_pkl='DrugRepurpose_item'+scale+'.pkl'
 
+
+        if self.kfold:
+            data_induce = np.arange(0, len(train_data))
+            kf = KFold(n_splits=5)
+            for train_index, test_index in kf.split(data_induce):
+                train_subdata = train_data[train_index]
+                test_subdata = train_data[test_index]
+
+                hg = self.removePositiveEdge(hg, etype_names_reverse[0], etype_names[0], eval_data= eval_data, test_data = test_data)
+                self.generate_metapath(hg,'disease',user_paths, user_metas, self._path, user_pkl)
+                self.generate_metapath(hg,'drug',item_paths, item_metas, self._path, item_pkl)
+                print("Paths sampled.")
+                print("Load paths from:")
+                print(user_pkl)
+                print(item_pkl)
+                user_file = open(self._path+'/'+user_pkl,'rb')
+                user_pth = pkl.load(user_file)
+                user_file.close()
+                item_file = open(self._path+'/'+item_pkl,'rb')
+                item_pth = pkl.load(item_file)
+                item_file.close()
+
+                train_set = MyDataset(user_pth, item_pth, user_metas, item_metas, train_subdata[:,:2], train_subdata[:,2])
+                train_loader= DataLoader(dataset=train_set, batch_size = self.batch_size, shuffle=True)
+                test_set = MyDataset(user_pth, item_pth, user_metas, item_metas, test_subdata[:,:2], test_subdata[:,2])
+                test_loader= DataLoader(dataset=test_set, batch_size = self.batch_size, shuffle= False)
+                eval_loader = None
+                train_loader= DataLoader(dataset=train_set, batch_size = self.batch_size, shuffle=True)
+                yield user_metas, item_metas, train_loader, eval_loader, test_loader, hg.num_nodes('disease'), hg.num_nodes('drug'), hg.num_nodes('protein'), hg.num_nodes('drug'), hg.num_nodes('sideeffect')
+
+            return
         #Generate paths.
         if self.saved == True or not (os.path.exists(self._path+'/'+user_pkl)):
             self.generate_metapath(hg,'disease',user_paths, user_metas, self._path, user_pkl)
@@ -632,12 +718,18 @@ class Dataloader:
         item_pth = pkl.load(item_file)
         item_file.close()
         train_set = MyDataset(user_pth, item_pth, user_metas, item_metas, train_data[:,:2], train_data[:,2])
-        eval_set = MyDataset(user_pth, item_pth, user_metas, item_metas, eval_data[:,:2], eval_data[:,2])
-        test_set = MyDataset(user_pth, item_pth, user_metas, item_metas, test_data[:,:2], test_data[:,2])
         train_loader= DataLoader(dataset=train_set, batch_size = self.batch_size, shuffle=True)
-        eval_loader= DataLoader(dataset=eval_set, batch_size = self.batch_size, shuffle=True)
-        test_loader= DataLoader(dataset=test_set, batch_size = self.batch_size, shuffle=True)
-
+        test_set = MyDataset(user_pth, item_pth, user_metas, item_metas, test_data[:,:2], test_data[:,2])
+        if self.inference:
+            eval_loader = None
+            inferenceSampler = InferenceFilter(test_set, self.usersid, self.itemsid)
+            sampler = BatchSampler(inferenceSampler, batch_size = self.batch_size, drop_last = False)
+            test_loader= DataLoader(dataset=test_set, batch_sampler = sampler)
+        else:
+            eval_set = MyDataset(user_pth, item_pth, user_metas, item_metas, eval_data[:,:2], eval_data[:,2])
+            eval_loader= DataLoader(dataset=eval_set, batch_size = self.batch_size, shuffle=False)
+            test_loader= DataLoader(dataset=test_set, batch_size = self.batch_size, shuffle= False)
+        
         #Prepare topk test set.
         if self.is_topk == True:
             if (os.path.exists(os.path.join(self._path, 'DrugRepurpose_topk_'+str(self.list_length)+'_.pkl'))):
@@ -650,7 +742,7 @@ class Dataloader:
                 print("Top K generated.")
             topk_set = MyDataset(user_pth, item_pth, user_metas, item_metas, topk_list[:,:2], topk_list[:,2])
             test_loader= DataLoader(dataset=topk_set, batch_size = self.batch_size, shuffle=False)
-        return user_metas, item_metas, train_loader, eval_loader, test_loader, hg.num_nodes('disease'), hg.num_nodes('drug'), hg.num_nodes('protein'), hg.num_nodes('drug'), hg.num_nodes('sideeffect')
+        yield user_metas, item_metas, train_loader, eval_loader, test_loader, hg.num_nodes('disease'), hg.num_nodes('drug'), hg.num_nodes('protein'), hg.num_nodes('drug'), hg.num_nodes('sideeffect')
 
     def _load_yelp(self):
         #business: 14284             user: 16239 
@@ -1612,6 +1704,8 @@ if __name__ == "__main__":
     parser.add_argument('-w', type=int, default=1,help='Scale of walk length.')
     parser.add_argument('-ratio', type=float, default=1,help='Sample ratio.')
     parser.add_argument('-i', type=bool, default=False,help='Inference stage. (Train ALL data and inference new links between users and items)')
+    parser.add_argument('-usersid', type=int, action="append", default=None, help='Specify users id to inference. Default all users.')
+    parser.add_argument('-itemsid', type=int, action="append", default=None, help='Specify items id to inference. Default all items.')
     args = parser.parse_args()
 
-    Dataloader(args.p, args.d, args.o, args.s, args.n, args.w, args.b, args.i,ratio=args.ratio).load_data()
+    Dataloader(args.p, args.d, args.o, args.s, args.n, args.w, args.b, args.i,ratio=args.ratio, usersid = args.usersid, itemsid = args.itemsid).load_data()
